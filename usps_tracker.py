@@ -4,6 +4,7 @@ import random
 import json
 from datetime import datetime
 import logging
+import requests
 import urllib3
 urllib3.disable_warnings()
 
@@ -17,12 +18,8 @@ import threading
 from queue import Queue, Empty
 from typing import List, Dict
 import os
-from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext
 import asyncio
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from playwright.async_api import async_playwright, Browser, BrowserContext
 
 # 配置日志
 logging.basicConfig(
@@ -79,11 +76,14 @@ async def setup_browser(browser_id: int = 1) -> tuple[Browser, BrowserContext]:
     try:
         playwright = await async_playwright().start()
         
-        # 设置代理
-        tunnel = "j441.kdltpspro.com:15818"
-        username = "t14382074795872"
-        password = "388m4xvh"
+        # 提取代理API接口，获取1个代理IP
+        api_url = "https://dps.kdlapi.com/api/getdps/?secret_id=omqfx0dzqab6pqyly4i9&signature=2n0f3pi97chx0iagox1jnueewfa461zx&num=1&pt=1&sep=1"
+                # 获取API接口返回的代理IP
+        proxy_ip = requests.get(api_url).text
         
+        # 用户名密码认证(私密代理/独享代理)
+        username = "d3191397958"
+        password = "buta6q28"
         # 随机生成浏览器参数
         viewport_width = random.randint(1280, 1920)
         viewport_height = random.randint(720, 1080)
@@ -153,11 +153,11 @@ async def setup_browser(browser_id: int = 1) -> tuple[Browser, BrowserContext]:
             timezone_id='Asia/Shanghai',
             geolocation={'latitude': latitude, 'longitude': longitude},
             permissions=['geolocation'],
-            #proxy={
-            #    'server': f'http://{tunnel}',
-            #    'username': username,
-            #    'password': password
-            #}
+            proxy={
+                'server': f'http://{proxy_ip}',
+                'username': username,
+                'password': password
+            }
         )
         
         # 设置请求头
@@ -330,117 +330,113 @@ def parse_worker(worker_id: int):
             logging.error(f"解析工作线程 {worker_id} 处理跟踪结果时出错: {str(e)}")
             continue
 
-async def page_worker(page_id: int, context: BrowserContext, total_numbers: int, results_filename: str):
+async def page_worker(page_id: int, total_numbers: int, results_filename: str):
     """页面工作线程，每个线程运行一个独立的页面"""
     global total_processed
-    try:
-        print(f"页面 {page_id} 已启动")
+    while True:
+        try:
+            # 从队列中获取批次，如果队列为空则退出
+            batch = batch_queue.get_nowait()
+        except Empty:
+            break
         
-        # 创建并保持页面打开
-        page = await context.new_page()
-            
-        while True:
-            try:
-                # 从队列中获取批次，如果队列为空则退出
-                batch = batch_queue.get_nowait()
-            except Empty:
-                break
-            
-            try:
-                # 构建查询URL，一次查询所有单号
-                tracking_numbers_str = ",".join(batch)
-                print(f"页面 {page_id} 正在处理: {len(batch)} 个单号")
-                
-                # 1. 访问首页
-                await page.goto("https://www.usps.com/")
-                
-                # 2. 点击导航菜单
-                # 等待导航菜单出现
-                await page.wait_for_selector(".nav-first-element", timeout=10000)
-                print(f"页面 {page_id} 成功加载导航菜单")
-                                    
-                # 点击导航菜单
-                await page.click(".nav-first-element")
-                # 点击第一个选项
-                await page.click(".menuheader ul li:first-child a")
-                
-                # 3. 等待输入框出现
-                await page.wait_for_selector("#tracking-input", timeout=10000)  # 等待10秒
-                print(f"页面 {page_id} 成功加载输入框")
-                
-                # 4. 输入跟踪号码
-                await page.fill("#tracking-input", tracking_numbers_str)
-                
-                # 5. 点击提交按钮
-                await page.click(".tracking-btn")
-                
-                # 等待跟踪结果容器出现
-                await page.wait_for_selector(".track-bar-container", timeout=10000)  # 等待10秒
-                print(f"页面 {page_id} 成功加载跟踪结果容器")
-                                    
-                # 获取所有容器
-                containers = await page.query_selector_all(".track-bar-container")
-                
-                # 将容器的HTML放入解析队列
-                for container in containers:
-                    # 获取对应的跟踪号码
-                    tracking_number = await container.query_selector(".tracking-number")
-                    tracking_number_text = await tracking_number.inner_text()
-                    tracking_number_text = tracking_number_text.strip()
-                    
-                    if not tracking_number_text:
-                        logging.error(f"找不到跟踪单号，请联系管理员是否usps网站更新")
-                        await page.close()
-                        return
-                        
-                    container_html = await container.inner_html()
-                    container_data = {
-                        'tracking_number': tracking_number_text,
-                        'html': container_html
-                    }
-                    parse_queue.put(container_data)
-                
-                # 更新进度
-                with progress_counter:
-                    total_processed += len(batch)
-                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 页面 {page_id} 进度: {total_processed}/{total_numbers} 个单号已处理")
-                
-                # 每处理完一批就保存结果
-                processed_batch = save_results(results_filename, is_first_batch=(total_processed == len(batch)))
-                if processed_batch:
-                    # 获取当前状态
-                    state = TrackingState()
-                    processed_numbers = set(state.get_processed_numbers())
-                    failed_numbers = set(state.get_failed_numbers())
-                    
-                    # 更新处理状态
-                    processed_numbers.update(processed_batch)
-                    # 从失败列表中移除成功处理的单号
-                    failed_numbers.difference_update(processed_batch)
-                    # 保存状态
-                    state.save_state(list(processed_numbers), list(failed_numbers))
-                    logging.info(f"已保存 {len(processed_batch)} 个结果到文件")
-                
-            except Exception as e:
-                logging.error(f"页面 {page_id} 处理批次时出错: {str(e)}")
-                
-                # 检查是否被重定向到维护页面
-                if "anyapp_outage_apology" in page.url:
-                    logging.error(f"页面 {page_id} 被重定向到维护页面，请联系管理员")
-                    # 如果被重定向，重新创建页面
-                    time.sleep(60)
-                
-                # 如果页面出现问题，重新创建页面
-                await page.close()
-                page = await context.new_page()
+        try:
+            # 创建新的浏览器上下文以获取新IP
+            browser, new_context = await setup_browser(page_id)
+            if not browser or not new_context:
+                logging.error(f"页面 {page_id} 创建新浏览器上下文失败")
                 continue
+            
+            # 创建并保持页面打开
+            page = await new_context.new_page()
+            
+            # 构建查询URL，一次查询所有单号
+            tracking_numbers_str = ",".join(batch)
+            print(f"页面 {page_id} 正在处理: {len(batch)} 个单号")
+            
+            # 1. 访问首页
+            await page.goto("https://www.usps.com/")
+            
+            # 2. 点击导航菜单
+            # 等待导航菜单出现
+            await page.wait_for_selector(".nav-first-element", timeout=10000)
+            print(f"页面 {page_id} 成功加载导航菜单")
+                                
+            # 点击导航菜单
+            await page.click(".nav-first-element")
+            # 点击第一个选项
+            await page.click(".menuheader ul li:first-child a")
+            
+            # 3. 等待输入框出现
+            await page.wait_for_selector("#tracking-input", timeout=10000)  # 等待10秒
+            print(f"页面 {page_id} 成功加载输入框")
+            
+            # 4. 输入跟踪号码
+            await page.fill("#tracking-input", tracking_numbers_str)
+            
+            # 5. 点击提交按钮
+            await page.click(".tracking-btn")
+            
+            # 等待跟踪结果容器出现
+            await page.wait_for_selector(".track-bar-container", timeout=10000)  # 等待10秒
+            print(f"页面 {page_id} 成功加载跟踪结果容器")
+                                
+            # 获取所有容器
+            containers = await page.query_selector_all(".track-bar-container")
+            
+            # 将容器的HTML放入解析队列
+            for container in containers:
+                # 获取对应的跟踪号码
+                tracking_number = await container.query_selector(".tracking-number")
+                tracking_number_text = await tracking_number.inner_text()
+                tracking_number_text = tracking_number_text.strip()
                 
-    except Exception as e:
-        logging.error(f"页面 {page_id} 工作线程出错: {str(e)}")
-    finally:
-        # 最后才关闭页面
-        if page:
+                if not tracking_number_text:
+                    logging.error(f"找不到跟踪单号，请联系管理员是否usps网站更新")
+                    return
+                    
+                container_html = await container.inner_html()
+                container_data = {
+                    'tracking_number': tracking_number_text,
+                    'html': container_html
+                }
+                parse_queue.put(container_data)
+            
+            # 更新进度
+            with progress_counter:
+                total_processed += len(batch)
+                print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 页面 {page_id} 进度: {total_processed}/{total_numbers} 个单号已处理")
+            
+            # 每处理完一批就保存结果
+            processed_batch = save_results(results_filename, is_first_batch=(total_processed == len(batch)))
+            if processed_batch:
+                # 获取当前状态
+                state = TrackingState()
+                processed_numbers = set(state.get_processed_numbers())
+                failed_numbers = set(state.get_failed_numbers())
+                
+                # 更新处理状态
+                processed_numbers.update(processed_batch)
+                # 从失败列表中移除成功处理的单号
+                failed_numbers.difference_update(processed_batch)
+                # 保存状态
+                state.save_state(list(processed_numbers), list(failed_numbers))
+                logging.info(f"已保存 {len(processed_batch)} 个结果到文件")
+            
+        except Exception as e:
+            logging.error(f"页面 {page_id} 处理批次时出错: {str(e)}")
+            
+            # 检查是否被重定向到维护页面
+            if "anyapp_outage_apology" in page.url:
+                logging.error(f"页面 {page_id} 被重定向到维护页面，请联系管理员")
+                # 如果被重定向，等待一段时间后继续
+                
+            time.sleep(60)
+        finally:
+            # 关闭当前页面和浏览器上下文
             await page.close()
+            await new_context.close()
+            await browser.close()
 
 async def process_tracking_numbers(tracking_numbers: List[str], batch_size: int = 35, num_pages: int = 5, 
                            num_workers: int = 5):
@@ -475,56 +471,44 @@ async def process_tracking_numbers(tracking_numbers: List[str], batch_size: int 
         if batch:  # 确保批次不为空
             batch_queue.put(batch)
     
-    # 创建并启动浏览器
-    browser, context = await setup_browser(1)
-    if not browser or not context:
-        logging.error("浏览器创建失败")
-        return
+    # 创建并启动页面任务
+    page_tasks = []
+    for i in range(num_pages):
+        task = asyncio.create_task(page_worker(i+1, total_numbers, results_filename))
+        page_tasks.append(task)
     
-    try:
-        # 创建并启动页面任务
-        page_tasks = []
-        for i in range(num_pages):
-            task = asyncio.create_task(page_worker(i+1, context, total_numbers, results_filename))
-            page_tasks.append(task)
-        
-        # 创建并启动解析线程
-        parse_threads = []
-        for i in range(num_workers):
-            thread = threading.Thread(target=parse_worker, args=(i+1,))
-            thread.start()
-            parse_threads.append(thread)
-        
-        # 等待所有页面任务完成
-        await asyncio.gather(*page_tasks)
-        
-        # 等待所有解析线程完成
-        for thread in parse_threads:
-            thread.join()
-        
-        # 保存最终结果并更新状态
-        processed_batch = save_results(results_filename, is_first_batch=False)
-        if processed_batch:
-            # 更新处理状态
-            processed_numbers.update(processed_batch)
-            # 从失败列表中移除成功处理的单号
-            failed_numbers.difference_update(processed_batch)
-            # 更新失败列表
-            failed_batch = set(tracking_numbers) - set(processed_batch)
-            failed_numbers.update(failed_batch)
-            # 保存状态
-            state.save_state(list(processed_numbers), list(failed_numbers))
-            
-            if failed_batch:
-                logging.warning(f"当前批次有 {len(failed_batch)} 个单号处理失败")
-        
-        # 输出最终统计信息
-        logging.info(f"处理完成！成功处理: {len(processed_numbers)} 个，失败: {len(failed_numbers)} 个")
+    # 创建并启动解析线程
+    parse_threads = []
+    for i in range(num_workers):
+        thread = threading.Thread(target=parse_worker, args=(i+1,))
+        thread.start()
+        parse_threads.append(thread)
     
-    finally:
-        # 关闭浏览器
-        await context.close()
-        await browser.close()
+    # 等待所有页面任务完成
+    await asyncio.gather(*page_tasks)
+    
+    # 等待所有解析线程完成
+    for thread in parse_threads:
+        thread.join()
+    
+    # 保存最终结果并更新状态
+    processed_batch = save_results(results_filename, is_first_batch=False)
+    if processed_batch:
+        # 更新处理状态
+        processed_numbers.update(processed_batch)
+        # 从失败列表中移除成功处理的单号
+        failed_numbers.difference_update(processed_batch)
+        # 更新失败列表
+        failed_batch = set(tracking_numbers) - set(processed_batch)
+        failed_numbers.update(failed_batch)
+        # 保存状态
+        state.save_state(list(processed_numbers), list(failed_numbers))
+        
+        if failed_batch:
+            logging.warning(f"当前批次有 {len(failed_batch)} 个单号处理失败")
+    
+    # 输出最终统计信息
+    logging.info(f"处理完成！成功处理: {len(processed_numbers)} 个，失败: {len(failed_numbers)} 个")
 
 def main():
     try:
